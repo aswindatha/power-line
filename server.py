@@ -4,10 +4,21 @@
 import re
 import os
 import time
+import argparse
 import socket
 import random
 import threading
 import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 import serial
 import serial.tools.list_ports
 from flask import Flask, jsonify, request, send_from_directory
@@ -26,19 +37,64 @@ except ImportError:
         print("Please install manually: pip install qrcode pillow")
         qrcode = None
 
-# ============ Configuration ============
-DEFAULT_PORT = "COM5"
-BAUD_RATE = 115200
-FLASK_PORT = 5000
+# ============ Configuration / CLI Arguments ============
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="POWERLINE GUARD COMMAND CENTER")
+    parser.add_argument(
+        "--port", "-p",
+        default=os.environ.get("SERIAL_PORT"),
+        help="Serial port (e.g., COM5, /dev/ttyUSB0). If not specified, auto-detects 'USB Serial Device' or first available COM port."
+    )
+    parser.add_argument(
+        "--baud", "-b",
+        type=int,
+        default=int(os.environ.get("SERIAL_BAUD", 115200)),
+        help="Baud rate (default: 115200)"
+    )
+    parser.add_argument(
+        "--web-port", "-w",
+        type=int,
+        default=int(os.environ.get("FLASK_PORT", 5000)),
+        help="Web dashboard Flask port (default: 5000)"
+    )
+    parser.add_argument(
+        "--baseline",
+        type=float,
+        default=float(os.environ.get("BASELINE", 850.0)),
+        help="Default nominal baseline in Newtons (default: 850.0)"
+    )
+    parser.add_argument(
+        "--station",
+        default=os.environ.get("STATION_NAME", "Station Alpha"),
+        help="Station name (default: Station Alpha)"
+    )
+    parser.add_argument(
+        "--line",
+        default=os.environ.get("TRANSMISSION_LINE", "Line 12"),
+        help="Transmission line name (default: Line 12)"
+    )
+    parser.add_argument(
+        "--maps-url",
+        default=os.environ.get("MAPS_URL", "https://maps.app.goo.gl/cG3Vp3PG5SM1JvLQ9"),
+        help="Google Maps URL location of the station"
+    )
+    args, _ = parser.parse_known_args()
+    return args
+
+args = parse_arguments()
+
+DEFAULT_PORT = args.port
+BAUD_RATE = args.baud
+FLASK_PORT = args.web_port
 
 # ============ Global State & Thread Safety ============
 monitoring = False
-baseline = 850.0  # Default nominal baseline in Newtons
-current_tension = 847.0
+baseline = args.baseline  # Default nominal baseline in Newtons
+current_tension = baseline - 3.0
 status = "SAFE"
-station_name = "Station Alpha"
-transmission_line = "Line 12"
-maps_url = "https://maps.app.goo.gl/cG3Vp3PG5SM1JvLQ9"
+station_name = args.station
+transmission_line = args.line
+maps_url = args.maps_url
 reading_history = []
 
 ALERT_THRESHOLD = 0.70      # 70% of baseline (trigger warning/alert below this)
@@ -140,18 +196,24 @@ def run_keyboard_listener():
                 pass
 
 def find_serial_port():
-    """Find the best serial port: prefers DEFAULT_PORT (COM6) or the first available COM port"""
+    """Find the best serial port: prefers ports with 'USB Serial Device' in description, then DEFAULT_PORT if set"""
     ports = list(serial.tools.list_ports.comports())
     if not ports:
         return None
     
-    # Try default port first
+    # 1. Look for a port matching 'USB Serial Device' in its description
     for p in ports:
-        if p.device == DEFAULT_PORT:
-            return DEFAULT_PORT
+        description = p.description or ""
+        if "usb serial device" in description.lower():
+            return p.device
             
-    # Fallback to the first available COM port
-    return ports[0].device
+    # 2. Try default port next
+    if DEFAULT_PORT:
+        for p in ports:
+            if p.device == DEFAULT_PORT:
+                return DEFAULT_PORT
+                
+    return None
 
 def parse_serial_line(line):
     """Parse serial line formatted as 'Weight: <val> Status: <status>' or similar"""
@@ -349,6 +411,31 @@ def serve(path):
 
 # ============ Main Execution ============
 if __name__ == "__main__":
+    # If no serial port is automatically identified, prompt the user for input
+    port = find_serial_port()
+    if not port:
+        ports = list(serial.tools.list_ports.comports())
+        if ports:
+            print("\n⚠️ Could not automatically detect a 'USB Serial Device' or default port.")
+            print("Available COM ports:")
+            for i, p in enumerate(ports):
+                print(f"  [{i+1}] {p.device} - {p.description}")
+            try:
+                user_val = input(f"Select a port (1-{len(ports)}) or type the COM port name (or press Enter for Simulation Mode): ").strip()
+                if user_val:
+                    if user_val.isdigit():
+                        idx = int(user_val) - 1
+                        if 0 <= idx < len(ports):
+                            DEFAULT_PORT = ports[idx].device
+                            print(f"Selected port: {DEFAULT_PORT}")
+                        else:
+                            print("Invalid selection. Starting in SIMULATION MODE.")
+                    else:
+                        DEFAULT_PORT = user_val
+                        print(f"Selected port: {DEFAULT_PORT}")
+            except Exception as e:
+                print(f"Error reading input: {e}")
+                
     # Start the serial background thread
     reader_thread = threading.Thread(target=run_serial_reader, daemon=True)
     reader_thread.start()
